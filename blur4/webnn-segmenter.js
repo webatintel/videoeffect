@@ -17,9 +17,9 @@ export class WebNNSegmenter {
     this.built = false;
   }
 
-  async segmentPeople(imageData) {
+  async segment(imageData) {
     if (!this.built) {
-      const graph = await this.selfieSegmentation.load({ deviceType: this.deviceType })
+      const graph = await this.selfieSegmentation.load()
       await this.selfieSegmentation.build(graph);
       this.built = true;
     }
@@ -42,6 +42,27 @@ export class WebNNSegmenter {
       }
     }
     const result = await this.selfieSegmentation.compute(inputArray);
+    const img = new ImageData(width, height);
+    const dst = img.data;
+    for (let i = 0, p = 0; i < dst.length; i += 4) {
+      const v = Math.max(0, Math.min(1, result[p++])) * 255;
+      dst[i] = dst[i + 1] = dst[i + 2] = dst[i + 3] = Math.round(v);
+    }
+    return img;
+  }
+
+  async getInputBuffer(device) {
+    if (!this.built) {
+      const graph = await this.selfieSegmentation.load({ gpuDevice: device });
+      await this.selfieSegmentation.build(graph);
+      this.built = true;
+    }
+    return this.selfieSegmentation.getInputBuffer();
+  }
+
+  async segmentGPUBuffer(width, height) {
+    console.assert(this.built);
+    const result = await this.selfieSegmentation.compute();
     const img = new ImageData(width, height);
     const dst = img.data;
     for (let i = 0, p = 0; i < dst.length; i += 4) {

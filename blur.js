@@ -5,6 +5,7 @@
 import { createWebGPUBlurRenderer } from './webgpu-renderer.js';
 import { createWebGL2BlurRenderer } from './webgl-renderer.js';
 import { TriangleFakeSegmenter } from './blur4/triangle-fake-segmenter.js';
+import { MediaPipeSegmenter } from './blur4/mediapipe-segmenter.js';
 import { WebNNSegmenter } from './blur4/webnn-segmenter.js';
 import { WebRTCSink } from './webrtc-sink.js';
 
@@ -29,14 +30,7 @@ async function initializeSegmenter() {
         break;
       case 'mediapipe':
         // CPU-based segmentation using MediaPipe
-        segmenter = await bodySegmentation.createSegmenter(
-            bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation,
-            {
-              runtime: 'mediapipe',
-              modelType: 'landscape',
-              solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation',
-            }
-        );
+        segmenter = new MediaPipeSegmenter();
         console.log('Using CPU (MediaPipe) for segmentation');
         break;
       case 'webnn-gpu':
@@ -56,26 +50,6 @@ async function initializeSegmenter() {
   }
 }
 
-async function segmenterFunction(downscaledImageData) {
-  const segmentation = await segmenter.segmentPeople(downscaledImageData);
-  if (!segmentation || segmentation.length === 0) {
-    console.warn("Segmentation returned no results.");
-    return null;
-  }
-  let maskImageData;
-  if (segmentation instanceof ImageData) {
-    maskImageData = segmentation;
-  } else {
-    if (!segmentation || segmentation.length === 0) {
-      console.warn("Segmentation returned no results.");
-      return null;
-    }
-
-    maskImageData = await segmentation[0].mask.toImageData();
-  }
-  return maskImageData;
-}
-
 // Initialize blur renderer based on radio buttons
 async function initializeBlurRenderer() {
   const useWebGPU = document.querySelector('input[name="renderer"]:checked').value === 'webgpu';
@@ -84,11 +58,11 @@ async function initializeBlurRenderer() {
     if (useWebGPU && 'gpu' in navigator) {
       const zeroCopy = zeroCopyCheckbox.checked;
       const directOutput = directOutputCheckbox.checked;
-      appBlurRenderer = await createWebGPUBlurRenderer(segmenterFunction, zeroCopy, directOutput);
+      appBlurRenderer = await createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput);
       appStatus.innerText = 'Renderer: WebGPU';
       console.log('Using WebGPU for blur rendering');
     } else {
-      appBlurRenderer = await createWebGL2BlurRenderer(segmenterFunction);
+      appBlurRenderer = await createWebGL2BlurRenderer(segmenter);
       appStatus.innerText = 'Renderer: WebGL2';
       console.log('Using WebGL2 for blur rendering');
     }
@@ -98,7 +72,7 @@ async function initializeBlurRenderer() {
     console.warn(`Failed to initialize ${useWebGPU ? 'WebGPU' : 'WebGL2'} renderer:`, error);
     // Fallback to WebGL2 if WebGPU fails
     if (useWebGPU) {
-      appBlurRenderer = await createWebGL2BlurRenderer(segmenterFunction);
+      appBlurRenderer = await createWebGL2BlurRenderer(segmenter);
       // The fallback should also use the video element path
       appProcessedVideo.style.display = 'block';
       appStatus.innerText = 'Renderer: WebGL2 (WebGPU fallback)';
@@ -331,7 +305,7 @@ function updateOptionState() {
   const useWebRTCSink = webrtcSink.checked;
   webrtcCodec.style.display = useWebRTCSink ? 'inline-block' : 'none';
   webrtcCodecLabel.style.display = useWebRTCSink ? 'block' : 'none';
-};
+}
 
 async function initializeApp() {
   // Populate WebRTC codec options

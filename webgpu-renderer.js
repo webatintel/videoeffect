@@ -4,224 +4,324 @@
 
 import { WebGPUBlur } from './webgpu-blur.js';
 
-function getTextureFormat(directOutput) {
-  return directOutput ? navigator.gpu.getPreferredCanvasFormat() : 'rgba8unorm';
-}
+class WebGPURenderer {
+  constructor(device, segmenter, blurrer, { zeroCopy, directOutput }) {
+    console.log("createWebGPUBlurRenderer zeroCopy:", zeroCopy, "directOutput:", directOutput);
+    this.device = device;
+    this.segmenter = segmenter;
+    this.blurrer = blurrer;
+    this.zeroCopy = zeroCopy;
+    this.directOutput = directOutput;
 
-function getOrCreateResource(cache, key, createFn) {
-  if (!cache[key]) {
-    console.log("Creating new resource for ", key);
-    cache[key] = createFn();
-  }
-  return cache[key];
-}
-
-function getOrCreateTexture(device, cache, key, size, directOutput, usage) {
-  const [width, height] = size;
-  const format = getTextureFormat(directOutput);
-  const cacheKey = `${key}_${width}x${height}_${format}_${usage}`;
-
-  let texture = cache[cacheKey];
-  if (!texture || texture.width !== width || texture.height !== height) {
-    console.log("Creating new texture for ", cacheKey, " with format ", format, " and usage ", usage);
-    if (texture) {
-      texture.destroy();
-    }
-    texture = device.createTexture({
-      size,
-      format,
-      usage,
-    });
-    cache[cacheKey] = texture;
-  }
-  return texture;
-}
-
-let imageDataCache;
-
-async function renderWithWebGPU(params, videoFrame, resourceCache) {
-  const device = params.device;
-  const webgpuCanvas = params.webgpuCanvas;
-  const width = params.webgpuCanvas.width;
-  const height = params.webgpuCanvas.height;
-  const segmenter = params.segmenter;
-  const blurrer = params.blurrer;
-
-  // Import external texture.
-  let sourceTexture;
-  if (params.zeroCopy) {
-    sourceTexture = device.importExternalTexture({
-      source: videoFrame,
-    });
-  } else {
-    sourceTexture = getOrCreateTexture(device, resourceCache, 'sourceTexture',
-      [videoFrame.displayWidth, videoFrame.displayHeight, 1],
-      params.directOutput,
-      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT);
-
-    device.queue.copyExternalImageToTexture(
-      { source: videoFrame },
-      { texture: sourceTexture },
-      [videoFrame.displayWidth, videoFrame.displayHeight]
-    );
-  }
-  // Scale down input, segment, read back and upload.
-  let maskTexture;
-  {
-    const segmentationWidth = params.segmentationWidth;
-    const segmentationHeight = params.segmentationHeight;
-    const destTexture = getOrCreateTexture(device, resourceCache, 'downscaleDest',
-      [segmentationWidth, segmentationHeight, 1],
-      params.directOutput,
-      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC);
-
-    let downscaleBindGroup;
-    try {
-      downscaleBindGroup = device.createBindGroup({
-        layout: params.downscalePipeline.getBindGroupLayout(0),
-        entries: [
-          {
-            binding: 0, resource: params.zeroCopy ? sourceTexture : sourceTexture.createView()
-          },
-          { binding: 1, resource: params.downscaleSampler },
-          { binding: 2, resource: destTexture.createView() },
-        ],
-      });
-    } catch (error) {
-      console.warn('bind failed:', error);
+    // Always use full resolution for processing, regardless of display size
+    this.webgpuCanvas = new OffscreenCanvas(1280, 720);
+    this.context = this.webgpuCanvas.getContext('webgpu');
+    if (!this.context) {
+      throw new Error('WebGPU context not available');
     }
 
-    const commandEncoder = device.createCommandEncoder();
-    const computePass = commandEncoder.beginComputePass();
-    computePass.setPipeline(params.downscalePipeline);
-    computePass.setBindGroup(0, downscaleBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(segmentationWidth / 8), Math.ceil(segmentationHeight / 8));
-    computePass.end();
-
-    const bufferSize = segmentationWidth * segmentationHeight * 4;
-    const readbackBuffer = getOrCreateResource(resourceCache, `readbackBuffer${bufferSize}`, () =>
-      device.createBuffer({
-        size: bufferSize,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      }));
-    commandEncoder.copyTextureToBuffer(
-      { texture: destTexture },
-      { buffer: readbackBuffer, bytesPerRow: segmentationWidth * 4 },
-      [segmentationWidth, segmentationHeight]
-    );
-    device.queue.submit([commandEncoder.finish()]);
-    await readbackBuffer.mapAsync(GPUMapMode.READ);
-    const downscaledImageData = imageDataCache ?
-      imageDataCache :
-      new ImageData(segmentationWidth, segmentationHeight);
-    downscaledImageData.data.set(new Uint8Array(readbackBuffer.getMappedRange()));
-    readbackBuffer.unmap();
-
-    // Segment
-    const maskImageData = await segmenter(downscaledImageData);
-
-    // Upload
-    maskTexture = getOrCreateTexture(device, resourceCache, 'maskTexture',
-      [maskImageData.width, maskImageData.height, 1],
-      params.directOutput,
-      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT);
-
-    device.queue.writeTexture(
-      { texture: maskTexture },
-      maskImageData.data,
-      { bytesPerRow: maskImageData.width * 4 },
-      [maskImageData.width, maskImageData.height, 1]
-    );
-  }
-
-  // Always process at full video resolution, ignore display size
-  const processingWidth = videoFrame.displayWidth || 1280;
-  const processingHeight = videoFrame.displayHeight || 720;
-
-  // Update canvas size only if video resolution actually changed
-  if (webgpuCanvas.width !== processingWidth || webgpuCanvas.height !== processingHeight) {
-    webgpuCanvas.width = processingWidth;
-    webgpuCanvas.height = processingHeight;
-    // Reconfigure context with actual video size
-    context.configure({
-      device: device,
+    this.format = directOutput ? navigator.gpu.getPreferredCanvasFormat() : 'rgba8unorm';
+    this.context.configure({
+      device: this.device,
       format: navigator.gpu.getPreferredCanvasFormat(),
       alphaMode: 'premultiplied',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | (params.directOutput ? GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST : 0),
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | (directOutput ? GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST : 0),
     });
+
+    this.segmentationWidth = 256;
+    this.segmentationHeight = 144;
+    this.downscaledImageData = new ImageData(this.segmentationWidth, this.segmentationHeight);
+
+    this.downscaleShader = fetch('blur4/shaders/downscale.wgsl').then(res => res.text())
+      .then(code => this.device.createShaderModule({
+        code: code.replace(/\${(\w+)}/g, (...groups) => ({
+          inputTextureType: zeroCopy ? "texture_external" : "texture_2d<f32>",
+          outputTextureType: this.format,
+        }[groups[1]]))
+      }));
+    this.downscalePipeline = this.downscaleShader.then(module => this.device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint: 'main' },
+    }));
+    this.downscaleSampler = this.device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+    });
+
+    if (this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu') {
+      // Try direct array<f16> when supported, fall back to 2x u32 packing.
+      let packShaderUrl;
+      if (this.device.features.has('shader-f16')) {
+        // Tight array<f16> layout: 3 f16 per pixel (3 * 2 bytes = 6 bytes)
+        // WGSL: write rgb as consecutive f16 elements in an array<f16>
+        packShaderUrl = 'blur4/shaders/pack-f16.wgsl';
+      } else {
+        // Fallback: Pack as two u32 per pixel
+        packShaderUrl = 'blur4/shaders/pack-u32.wgsl';
+      }
+
+      this.packModule = fetch(packShaderUrl).then(res => res.text())
+        .then(code => this.device.createShaderModule({ code }));
+      this.packPipeline = this.packModule
+        .then(module => this.device.createComputePipeline({
+          layout: 'auto',
+          compute: { module: module, entryPoint: 'main' },
+        }));
+    }
+
+    // Create a simple render pipeline to copy the compute shader's output (RGBA)
+    // to the canvas, which might have a different format (e.g., BGRA).
+    this.outputRendererVertexShader = fetch('blur4/shaders/render.vertex.wgsl').then(res => res.text())
+      .then(code => this.device.createShaderModule({ code }));
+
+    this.outputRendererFragmentShader = null;
+    this.lastDim = null;
+    this.renderSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+    this.resourceCache = {};
   }
 
-  const canvasTexture = params.context.getCurrentTexture();
-  const outputTexture = getOrCreateTexture(device, resourceCache, 'outputTexture',
-    [width, height, 1],
-    params.directOutput,
-    GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING);
+  async getOrCreateResource(key, createFn) {
+    if (!this.resourceCache[key]) {
+      console.log("Creating new resource for ", key);
+      this.resourceCache[key] = await createFn();
+    }
+    return this.resourceCache[key];
+  }
 
-  const commandEncoder = device.createCommandEncoder();
-  blurrer.setInputDimensions(processingWidth, processingHeight);
-  blurrer.blur(commandEncoder, sourceTexture, maskTexture, params.directOutput ? canvasTexture : outputTexture, 360);
+  getOrCreateTexture(key, size, directOutput, usage) {
+    const [width, height] = size;
+    const cacheKey = `${key}_${width}x${height}_${this.format}_${usage}`;
 
-  if (!params.directOutput) {
-    const renderPipeline = getOrCreateResource(resourceCache, `renderPipeline_${width}x${height}`, () =>
-      device.createRenderPipeline({
-        layout: 'auto',
-        vertex: {
-          module: params.outputRendererVertexShader,
-          entryPoint: 'main',
-        },
-        fragment: {
-          module: params.getOutputRendererFragmentShader(device, width, height),
-          entryPoint: 'main',
-          targets: [{
-            format: navigator.gpu.getPreferredCanvasFormat(),
-          }],
-        },
-        primitive: {
-          topology: 'triangle-list',
-        },
-      }));
+    let texture = this.resourceCache[cacheKey];
+    if (!texture || texture.width !== width || texture.height !== height) {
+      console.log("Creating new texture for", cacheKey, "with format", this.format, "and usage", usage);
+      if (texture) {
+        console.log("Destroying old texture for", cacheKey);
+        texture.destroy();
+      }
+      texture = this.device.createTexture({ size, format: this.format, usage });
+      this.resourceCache[cacheKey] = texture;
+    }
+    return texture;
+  }
 
-    const renderBindGroup = device.createBindGroup({
-      layout: renderPipeline.getBindGroupLayout(0),
+  async getOutputRendererFragmentShader(device, width, height) {
+    if (!this.outputRendererFragmentShader || this.lastDim !== [width, height]) {
+      this.outputRendererFragmentShader = await this.device.createShaderModule({
+        code: await fetch('blur4/shaders/render.fragment.wgsl').then(res => res.text())
+          .then(code => code.replace(/\${(\w+)}/g, (...groups) => ({ width, height }[groups[1]]))),
+      });
+
+      this.lastDim = [width, height];
+    }
+    return this.outputRendererFragmentShader;
+  }
+
+  async downscale(sourceTexture) {
+    const destTexture = this.getOrCreateTexture(
+      'downscaleDest',
+      [this.segmentationWidth, this.segmentationHeight, 1],
+      this.directOutput,
+      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
+    );
+
+    const downscaleBindGroup = this.device.createBindGroup({
+      layout: (await this.downscalePipeline).getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: outputTexture.createView() },
-        { binding: 1, resource: params.renderSampler },
+        { binding: 0, resource: this.zeroCopy ? sourceTexture : sourceTexture.createView() },
+        { binding: 1, resource: this.downscaleSampler },
+        { binding: 2, resource: destTexture.createView() },
       ],
     });
 
-    // Render to canvas
-    const renderPass = commandEncoder.beginRenderPass({
-      colorAttachments: [{
-        view: canvasTexture.createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-    });
+    if (!this.commandEncoder) {
+      this.commandEncoder = this.device.createCommandEncoder();
+    }
+    const computePass = this.commandEncoder.beginComputePass();
+    computePass.setPipeline(await this.downscalePipeline);
+    computePass.setBindGroup(0, downscaleBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
+    computePass.end();
 
-    renderPass.setPipeline(renderPipeline);
-    renderPass.setBindGroup(0, renderBindGroup);
-    renderPass.draw(6);
-    renderPass.end();
+    return destTexture;
   }
 
-  device.queue.submit([commandEncoder.finish()]);
+  async segment(destTexture) {
+    if (!this.commandEncoder) {
+      this.commandEncoder = this.device.createCommandEncoder();
+    }
+    if (this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu') {
+      const packedBuffer = await this.segmenter.getInputBuffer(this.device);
+      const packBindGroup = this.device.createBindGroup({
+        layout: (await this.packPipeline).getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: destTexture },
+          { binding: 1, resource: { buffer: packedBuffer } },
+        ],
+      });
 
-  // Create a new VideoFrame from the processed WebGPU canvas
-  const processedVideoFrame = new VideoFrame(params.webgpuCanvas, {
-    timestamp: videoFrame.timestamp,
-    duration: videoFrame.duration
-  });
+      const packPass = this.commandEncoder.beginComputePass();
+      packPass.setPipeline(await this.packPipeline);
+      packPass.setBindGroup(0, packBindGroup);
+      packPass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
+      packPass.end();
 
-  return processedVideoFrame;
+      this.device.queue.submit([this.commandEncoder.finish()]);
+      this.commandEncoder = null;
+      await this.device.queue.onSubmittedWorkDone();
+      packedBuffer.destroy();
+      console.log(destTexture, packedBuffer);
+      return await this.segmenter.segmentGPUBuffer(this.segmentationWidth, this.segmentationHeight);
+    } else {
+      const bufferSize = this.segmentationWidth * this.segmentationHeight * 4;
+      const readbackBuffer = await this.getOrCreateResource(`readbackBuffer${bufferSize}`, async () =>
+        this.device.createBuffer({
+          size: bufferSize,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        }));
+      this.commandEncoder.copyTextureToBuffer(
+        { texture: destTexture },
+        { buffer: readbackBuffer, bytesPerRow: this.segmentationWidth * 4 },
+        [this.segmentationWidth, this.segmentationHeight]
+      );
+      this.device.queue.submit([this.commandEncoder.finish()]);
+      this.commandEncoder = null;
+      await readbackBuffer.mapAsync(GPUMapMode.READ);
+      this.downscaledImageData.data.set(new Uint8Array(readbackBuffer.getMappedRange()));
+      readbackBuffer.unmap();
+
+      return await this.segmenter.segment(this.downscaledImageData);
+    }
+  }
+
+  async render(videoFrame) {
+    // Import external texture.
+    let sourceTexture;
+    if (this.zeroCopy) {
+      sourceTexture = this.device.importExternalTexture({ source: videoFrame });
+    } else {
+      sourceTexture = this.getOrCreateTexture(
+        'sourceTexture',
+        [videoFrame.displayWidth, videoFrame.displayHeight, 1],
+        this.directOutput,
+        GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+      );
+
+      this.device.queue.copyExternalImageToTexture(
+        { source: videoFrame },
+        { texture: sourceTexture },
+        [videoFrame.displayWidth, videoFrame.displayHeight]
+      );
+    }
+
+    let maskTexture;
+    {
+      const destTexture = await this.downscale(sourceTexture);
+      console.log('Downscale done, segmenting...');
+      const maskImageData = await this.segment(destTexture);
+      console.log('Segmentation done, uploading mask...');
+
+      // Upload
+      maskTexture = this.getOrCreateTexture(
+        'maskTexture',
+        [maskImageData.width, maskImageData.height, 1],
+        this.directOutput,
+        GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+      );
+      this.device.queue.writeTexture(
+        { texture: maskTexture },
+        maskImageData.data,
+        { bytesPerRow: maskImageData.width * 4 },
+        [maskImageData.width, maskImageData.height, 1]
+      );
+    }
+
+    // Always process at full video resolution, ignore display size
+    const processingWidth = videoFrame.displayWidth || 1280;
+    const processingHeight = videoFrame.displayHeight || 720;
+
+    // Update canvas size only if video resolution actually changed
+    if (this.webgpuCanvas.width !== processingWidth || this.webgpuCanvas.height !== processingHeight) {
+      this.webgpuCanvas.width = processingWidth;
+      this.webgpuCanvas.height = processingHeight;
+      // Reconfigure context with actual video size
+      this.context.configure({
+        device: this.device,
+        format: navigator.gpu.getPreferredCanvasFormat(),
+        alphaMode: 'premultiplied',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | (this.directOutput ? GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST : 0),
+      });
+    }
+    const width = this.webgpuCanvas.width;
+    const height = this.webgpuCanvas.height;
+
+    const canvasTexture = this.context.getCurrentTexture();
+    const outputTexture = this.getOrCreateTexture(
+      'outputTexture',
+      [width, height, 1],
+      this.directOutput,
+      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
+    );
+
+    const commandEncoder = this.device.createCommandEncoder();
+    this.blurrer.setInputDimensions(processingWidth, processingHeight);
+    this.blurrer.blur(commandEncoder, sourceTexture, maskTexture, this.directOutput ? canvasTexture : outputTexture, 360);
+
+    if (!this.directOutput) {
+      const renderPipeline = await this.getOrCreateResource(`renderPipeline_${width}x${height}`, async () =>
+        this.device.createRenderPipeline({
+          layout: 'auto',
+          vertex: {
+            module: await this.outputRendererVertexShader,
+            entryPoint: 'main',
+          },
+          fragment: {
+            module: await this.getOutputRendererFragmentShader(this.device, width, height),
+            entryPoint: 'main',
+            targets: [{ format: navigator.gpu.getPreferredCanvasFormat() }],
+          },
+          primitive: {
+            topology: 'triangle-list',
+          },
+        }));
+
+      const renderBindGroup = this.device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: outputTexture.createView() },
+          { binding: 1, resource: this.renderSampler },
+        ],
+      });
+
+      // Render to canvas
+      const renderPass = commandEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: canvasTexture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, renderBindGroup);
+      renderPass.draw(6);
+      renderPass.end();
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Create a new VideoFrame from the processed WebGPU canvas
+    return new VideoFrame(this.webgpuCanvas, {
+      timestamp: videoFrame.timestamp,
+      duration: videoFrame.duration
+    });
+  }
 }
 
 // WebGPU blur renderer
 export async function createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput) {
-  console.log("createWebGPUBlurRenderer zeroCopy: ", zeroCopy, " directOutput: ", directOutput);
-  // Always use full resolution for processing, regardless of display size
-  const webgpuCanvas = new OffscreenCanvas(1280, 720);
-
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) {
     throw new Error('WebGPU adapter not available');
@@ -235,128 +335,11 @@ export async function createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput
   if (!adapter.features.has('bgra8unorm-storage')) {
     console.log("BGRA8UNORM-STORAGE not supported");
   }
-  const device = await adapter.requestDevice({ requiredFeatures: ['bgra8unorm-storage'] });
-  const context = webgpuCanvas.getContext('webgpu');
-
-  if (!context) {
-    throw new Error('WebGPU context not available');
-  }
-
-  context.configure({
-    device: device,
-    format: navigator.gpu.getPreferredCanvasFormat(),
-    alphaMode: 'premultiplied',
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | (directOutput ? GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST : 0),
-  });
-
-  const segmentationWidth = 256;
-  const segmentationHeight = 144;
-
-  const downscaleShaderCode = `
-      @group(0) @binding(0) var inputTexture: ${zeroCopy ? "texture_external" : "texture_2d<f32>"};
-      @group(0) @binding(1) var textureSampler: sampler;
-      @group(0) @binding(2) var outputTexture: texture_storage_2d<${getTextureFormat(directOutput)}, write>;
-
-      @compute @workgroup_size(8, 8)
-      fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-        let outputDims = textureDimensions(outputTexture);
-        if (global_id.x >= outputDims.x || global_id.y >= outputDims.y) {
-            return;
-        }
-        let uv = (vec2<f32>(global_id.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(outputDims);
-        let color = textureSampleBaseClampToEdge(inputTexture, textureSampler, uv);
-        textureStore(outputTexture, global_id.xy, color);
-      }
-    `;
-
-  const downscaleShader = device.createShaderModule({ code: downscaleShaderCode });
-  const downscalePipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: {
-      module: downscaleShader,
-      entryPoint: 'main',
-    },
-  });
-
-  const downscaleSampler = device.createSampler({
-    magFilter: 'linear',
-    minFilter: 'linear',
-  });
+  const device = (await adapter.requestDevice({ requiredFeatures: ['bgra8unorm-storage', 'shader-f16'] }))
+    ?? (await adapter.requestDevice({ requiredFeatures: ['bgra8unorm-storage'] }));
 
   const blurrer = new WebGPUBlur(device, zeroCopy, directOutput);
   await blurrer.init();
 
-  // Create a simple render pipeline to copy the compute shader's output (RGBA)
-  // to the canvas, which might have a different format (e.g., BGRA).
-  const outputRendererVertexShader = device.createShaderModule({
-    code: `
-        @vertex
-        fn main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
-          var pos = array<vec2<f32>, 6>(
-            vec2<f32>(-1.0, -1.0),
-            vec2<f32>( 1.0, -1.0),
-            vec2<f32>(-1.0,  1.0),
-            vec2<f32>( 1.0, -1.0),
-            vec2<f32>( 1.0,  1.0),
-            vec2<f32>(-1.0,  1.0)
-          );
-          return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
-        }
-      `
-  });
-
-  let outputRendererFragmentShader;
-  let lastDim;
-
-  function getOutputRendererFragmentShader(device, width, height) {
-    if (!outputRendererFragmentShader || lastDim !== `${width}x${height}`) {
-      outputRendererFragmentShader = device.createShaderModule({
-        code: `
-            @group(0) @binding(0) var inputTexture: texture_2d<f32>;
-            @group(0) @binding(1) var textureSampler: sampler;
-          
-            @fragment
-            fn main(@builtin(position) coord: vec4<f32>) -> @location(0) vec4<f32> {
-              let uv = coord.xy / vec2<f32>(${width}.0, ${height}.0);
-              return textureSample(inputTexture, textureSampler, uv);
-            }
-          `});
-
-      lastDim = `${width}x${height}`;
-    }
-    return outputRendererFragmentShader;
-  }
-
-  const renderSampler = device.createSampler({
-    magFilter: 'linear',
-    minFilter: 'linear',
-  });
-
-  const resourceCache = {};
-
-  return {
-    render: async (videoFrame) => {
-      const params = {
-        device,
-        context,
-        webgpuCanvas,
-        outputRendererVertexShader,
-        getOutputRendererFragmentShader,
-        segmentationWidth,
-        segmentationHeight,
-        downscalePipeline,
-        downscaleSampler,
-        renderSampler,
-        zeroCopy,
-        directOutput,
-        segmenter,
-        blurrer
-      };
-      try {
-        return await renderWithWebGPU(params, videoFrame, resourceCache);
-      } catch (error) {
-        console.warn('WebGPU rendering failed:', error);
-      }
-    }
-  };
+  return new WebGPURenderer(device, segmenter, blurrer, { zeroCopy, directOutput });
 }
