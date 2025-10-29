@@ -20,7 +20,6 @@ class WebGPURenderer {
       throw new Error('WebGPU context not available');
     }
 
-    this.format = directOutput ? navigator.gpu.getPreferredCanvasFormat() : 'rgba8unorm';
     this.context.configure({
       device: this.device,
       format: navigator.gpu.getPreferredCanvasFormat(),
@@ -31,43 +30,26 @@ class WebGPURenderer {
     this.segmentationWidth = 256;
     this.segmentationHeight = 144;
     this.downscaledImageData = new ImageData(this.segmentationWidth, this.segmentationHeight);
-
-    this.downscaleShader = fetch('blur4/shaders/downscale.wgsl').then(res => res.text())
+    let downscaleShaderUrl;
+    if (this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu') {
+      downscaleShaderUrl = 'blur4/shaders/downscale-and-convert-to-rgb16float.wgsl';
+    } else {
+      downscaleShaderUrl = 'blur4/shaders/downscale-and-convert-to-rgba8unorm.wgsl';
+    }
+    this.downscaleModule = fetch(downscaleShaderUrl).then(res => res.text())
       .then(code => this.device.createShaderModule({
         code: code.replace(/\${(\w+)}/g, (...groups) => ({
           inputTextureType: zeroCopy ? "texture_external" : "texture_2d<f32>",
-          outputTextureType: this.format,
         }[groups[1]]))
       }));
-    this.downscalePipeline = this.downscaleShader.then(module => this.device.createComputePipeline({
+    this.downscalePipeline = this.downscaleModule.then(module => this.device.createComputePipeline({
       layout: 'auto',
-      compute: { module, entryPoint: 'main' },
+      compute: { module: module, entryPoint: 'main' },
     }));
     this.downscaleSampler = this.device.createSampler({
       magFilter: 'linear',
       minFilter: 'linear',
     });
-
-    if (this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu') {
-      // Try direct array<f16> when supported, fall back to 2x u32 packing.
-      let packShaderUrl;
-      if (this.device.features.has('shader-f16')) {
-        // Tight array<f16> layout: 3 f16 per pixel (3 * 2 bytes = 6 bytes)
-        // WGSL: write rgb as consecutive f16 elements in an array<f16>
-        packShaderUrl = 'blur4/shaders/pack-f16.wgsl';
-      } else {
-        // Fallback: Pack as two u32 per pixel
-        packShaderUrl = 'blur4/shaders/pack-u32.wgsl';
-      }
-
-      this.packModule = fetch(packShaderUrl).then(res => res.text())
-        .then(code => this.device.createShaderModule({ code }));
-      this.packPipeline = this.packModule
-        .then(module => this.device.createComputePipeline({
-          layout: 'auto',
-          compute: { module: module, entryPoint: 'main' },
-        }));
-    }
 
     // Create a simple render pipeline to copy the compute shader's output (RGBA)
     // to the canvas, which might have a different format (e.g., BGRA).
@@ -83,24 +65,24 @@ class WebGPURenderer {
 
   async getOrCreateResource(key, createFn) {
     if (!this.resourceCache[key]) {
-      console.log("Creating new resource for ", key);
+      console.log("Creating new resource", key);
       this.resourceCache[key] = await createFn();
     }
     return this.resourceCache[key];
   }
 
-  getOrCreateTexture(key, size, directOutput, usage) {
+  getOrCreateTexture(key, { size, usage, format = 'rgba8unorm' }) {
     const [width, height] = size;
-    const cacheKey = `${key}_${width}x${height}_${this.format}_${usage}`;
+    const cacheKey = `${key}_${width}x${height}_${format}_${usage}`;
 
     let texture = this.resourceCache[cacheKey];
     if (!texture || texture.width !== width || texture.height !== height) {
-      console.log("Creating new texture for", cacheKey, "with format", this.format, "and usage", usage);
+      console.log("Creating new texture", cacheKey, "with format", format, "and usage", usage);
       if (texture) {
-        console.log("Destroying old texture for", cacheKey);
+        console.log("Destroying old texture", cacheKey);
         texture.destroy();
       }
-      texture = this.device.createTexture({ size, format: this.format, usage });
+      texture = this.device.createTexture({ size, format, usage });
       this.resourceCache[cacheKey] = texture;
     }
     return texture;
@@ -118,61 +100,59 @@ class WebGPURenderer {
     return this.outputRendererFragmentShader;
   }
 
-  async downscale(sourceTexture) {
-    const destTexture = this.getOrCreateTexture(
-      'downscaleDest',
-      [this.segmentationWidth, this.segmentationHeight, 1],
-      this.directOutput,
-      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
-    );
+  async segment(sourceTexture) {
+    const useInterop = this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu';
 
+    let destTexture;
+    if (useInterop) {
+      destTexture = { buffer: await this.segmenter.getInputBuffer(this.device) };
+    } else {
+      destTexture = this.getOrCreateTexture('downscaleDest', {
+        size: [this.segmentationWidth, this.segmentationHeight, 1],
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
+        format: 'rgba8unorm',
+      });
+    }
     const downscaleBindGroup = this.device.createBindGroup({
       layout: (await this.downscalePipeline).getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.zeroCopy ? sourceTexture : sourceTexture.createView() },
         { binding: 1, resource: this.downscaleSampler },
-        { binding: 2, resource: destTexture.createView() },
+        { binding: 2, resource: useInterop ? destTexture : destTexture.createView() },
       ],
     });
 
-    if (!this.commandEncoder) {
-      this.commandEncoder = this.device.createCommandEncoder();
-    }
-    const computePass = this.commandEncoder.beginComputePass();
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
     computePass.setPipeline(await this.downscalePipeline);
     computePass.setBindGroup(0, downscaleBindGroup);
     computePass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
     computePass.end();
 
-    return destTexture;
-  }
+    if (useInterop) {
+      this.device.queue.submit([commandEncoder.finish()]);
+      destTexture.buffer.destroy();
 
-  async segment(destTexture) {
-    if (!this.commandEncoder) {
-      this.commandEncoder = this.device.createCommandEncoder();
-    }
-    if (this.segmenter.segmentGPUBuffer && this.segmenter.deviceType === 'gpu') {
-      const packedBuffer = await this.segmenter.getInputBuffer(this.device);
-      const packBindGroup = this.device.createBindGroup({
-        layout: (await this.packPipeline).getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: destTexture },
-          { binding: 1, resource: { buffer: packedBuffer } },
-        ],
-      });
+      await this.segmenter.segmentGPUBuffer();
 
-      const packPass = this.commandEncoder.beginComputePass();
-      packPass.setPipeline(await this.packPipeline);
-      packPass.setBindGroup(0, packBindGroup);
-      packPass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
-      packPass.end();
+      const outputBuffer = await this.segmenter.getOutputBuffer();
+      if (!this.maskTexture) {
+        this.maskTexture = this.device.createTexture({
+          size: [this.segmentationWidth, this.segmentationHeight, 1],
+          format: 'r16float',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+      }
+      const copyCommandEncoder = this.device.createCommandEncoder();
+      copyCommandEncoder.copyBufferToTexture(
+        { buffer: outputBuffer, bytesPerRow: this.segmentationWidth * 2 },
+        { texture: this.maskTexture },
+        [this.segmentationWidth, this.segmentationHeight, 1]
+      );
+      this.device.queue.submit([copyCommandEncoder.finish()]);
+      outputBuffer.destroy();
 
-      this.device.queue.submit([this.commandEncoder.finish()]);
-      this.commandEncoder = null;
-      await this.device.queue.onSubmittedWorkDone();
-      packedBuffer.destroy();
-      console.log(destTexture, packedBuffer);
-      return await this.segmenter.segmentGPUBuffer(this.segmentationWidth, this.segmentationHeight);
+      return this.maskTexture;
     } else {
       const bufferSize = this.segmentationWidth * this.segmentationHeight * 4;
       const readbackBuffer = await this.getOrCreateResource(`readbackBuffer${bufferSize}`, async () =>
@@ -180,18 +160,31 @@ class WebGPURenderer {
           size: bufferSize,
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         }));
-      this.commandEncoder.copyTextureToBuffer(
+      commandEncoder.copyTextureToBuffer(
         { texture: destTexture },
         { buffer: readbackBuffer, bytesPerRow: this.segmentationWidth * 4 },
         [this.segmentationWidth, this.segmentationHeight]
       );
-      this.device.queue.submit([this.commandEncoder.finish()]);
-      this.commandEncoder = null;
+      this.device.queue.submit([commandEncoder.finish()]);
       await readbackBuffer.mapAsync(GPUMapMode.READ);
       this.downscaledImageData.data.set(new Uint8Array(readbackBuffer.getMappedRange()));
       readbackBuffer.unmap();
 
-      return await this.segmenter.segment(this.downscaledImageData);
+      const maskImageData = await this.segmenter.segment(this.downscaledImageData);
+
+      // Upload
+      const maskTexture = this.getOrCreateTexture('maskTexture', {
+        size: [maskImageData.width, maskImageData.height, 1],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+      });
+      this.device.queue.writeTexture(
+        { texture: maskTexture },
+        maskImageData.data,
+        { bytesPerRow: maskImageData.width * 4 },
+        [maskImageData.width, maskImageData.height, 1]
+      );
+
+      return maskTexture;
     }
   }
 
@@ -201,12 +194,10 @@ class WebGPURenderer {
     if (this.zeroCopy) {
       sourceTexture = this.device.importExternalTexture({ source: videoFrame });
     } else {
-      sourceTexture = this.getOrCreateTexture(
-        'sourceTexture',
-        [videoFrame.displayWidth, videoFrame.displayHeight, 1],
-        this.directOutput,
-        GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
-      );
+      sourceTexture = this.getOrCreateTexture('sourceTexture', {
+        size: [videoFrame.displayWidth, videoFrame.displayHeight, 1],
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+      });
 
       this.device.queue.copyExternalImageToTexture(
         { source: videoFrame },
@@ -215,27 +206,7 @@ class WebGPURenderer {
       );
     }
 
-    let maskTexture;
-    {
-      const destTexture = await this.downscale(sourceTexture);
-      console.log('Downscale done, segmenting...');
-      const maskImageData = await this.segment(destTexture);
-      console.log('Segmentation done, uploading mask...');
-
-      // Upload
-      maskTexture = this.getOrCreateTexture(
-        'maskTexture',
-        [maskImageData.width, maskImageData.height, 1],
-        this.directOutput,
-        GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
-      );
-      this.device.queue.writeTexture(
-        { texture: maskTexture },
-        maskImageData.data,
-        { bytesPerRow: maskImageData.width * 4 },
-        [maskImageData.width, maskImageData.height, 1]
-      );
-    }
+    let maskTexture = await this.segment(sourceTexture);
 
     // Always process at full video resolution, ignore display size
     const processingWidth = videoFrame.displayWidth || 1280;
@@ -257,12 +228,10 @@ class WebGPURenderer {
     const height = this.webgpuCanvas.height;
 
     const canvasTexture = this.context.getCurrentTexture();
-    const outputTexture = this.getOrCreateTexture(
-      'outputTexture',
-      [width, height, 1],
-      this.directOutput,
-      GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
-    );
+    const outputTexture = this.getOrCreateTexture('outputTexture', {
+      size: [width, height, 1],
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
+    });
 
     const commandEncoder = this.device.createCommandEncoder();
     this.blurrer.setInputDimensions(processingWidth, processingHeight);
@@ -320,8 +289,7 @@ class WebGPURenderer {
   }
 }
 
-// WebGPU blur renderer
-export async function createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput) {
+export async function getWebGPUDevice() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) {
     throw new Error('WebGPU adapter not available');
@@ -329,15 +297,23 @@ export async function createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput
 
   // Ensure we're compatible with directOutput
   console.log("Adapter features:");
-  for (const feature of adapter.features) {
-    console.log(`- ${feature}`);
+  console.log([...adapter.features]);
+  const requiredFeatures = ['bgra8unorm-storage', 'shader-f16', 'texture-formats-tier1'];
+  for (const feature of requiredFeatures) {
+    if (!adapter.features.has(feature)) {
+      console.log(`${feature} is not supported`);
+    }
   }
-  if (!adapter.features.has('bgra8unorm-storage')) {
-    console.log("BGRA8UNORM-STORAGE not supported");
+  const device = await adapter.requestDevice({ requiredFeatures });
+  if (!device) {
+    console.error('WebGPU adapter does not support the required features:', requiredFeatures);
   }
-  const device = (await adapter.requestDevice({ requiredFeatures: ['bgra8unorm-storage', 'shader-f16'] }))
-    ?? (await adapter.requestDevice({ requiredFeatures: ['bgra8unorm-storage'] }));
 
+  return device;
+}
+
+// WebGPU blur renderer
+export async function createWebGPUBlurRenderer(device, segmenter, zeroCopy, directOutput) {
   const blurrer = new WebGPUBlur(device, zeroCopy, directOutput);
   await blurrer.init();
 

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { createWebGPUBlurRenderer } from './webgpu-renderer.js';
+import { getWebGPUDevice, createWebGPUBlurRenderer } from './webgpu-renderer.js';
 import { createWebGL2BlurRenderer } from './webgl-renderer.js';
 import { TriangleFakeSegmenter } from './blur4/triangle-fake-segmenter.js';
 import { MediaPipeSegmenter } from './blur4/mediapipe-segmenter.js';
@@ -20,7 +20,7 @@ let segmenter = null;
 let rendererSwitchRequested = false;
 
 // Initialize CPU-only segmenter using MediaPipe
-async function initializeSegmenter() {
+async function initializeSegmenter(webGpuDevice) {
   try {
     const segmenterType = document.querySelector('input[name="segmenter"]:checked').value;
     switch (segmenterType) {
@@ -34,11 +34,11 @@ async function initializeSegmenter() {
         console.log('Using CPU (MediaPipe) for segmentation');
         break;
       case 'webnn-gpu':
-        segmenter = new WebNNSegmenter('gpu');
+        segmenter = new WebNNSegmenter({ deviceType: 'gpu', webGpuDevice });
         console.log('Using WebNN GPU for segmentation');
         break;
       case 'webnn-npu':
-        segmenter = new WebNNSegmenter('npu');
+        segmenter = new WebNNSegmenter({ deviceType: 'npu' });
         console.log('Using WebNN NPU for segmentation');
         break;
       default:
@@ -51,14 +51,12 @@ async function initializeSegmenter() {
 }
 
 // Initialize blur renderer based on radio buttons
-async function initializeBlurRenderer() {
-  const useWebGPU = document.querySelector('input[name="renderer"]:checked').value === 'webgpu';
-
+async function initializeBlurRenderer(webGpuDevice) {
   try {
-    if (useWebGPU && 'gpu' in navigator) {
+    if (webGpuDevice) {
       const zeroCopy = zeroCopyCheckbox.checked;
       const directOutput = directOutputCheckbox.checked;
-      appBlurRenderer = await createWebGPUBlurRenderer(segmenter, zeroCopy, directOutput);
+      appBlurRenderer = await createWebGPUBlurRenderer(webGpuDevice, segmenter, zeroCopy, directOutput);
       appStatus.innerText = 'Renderer: WebGPU';
       console.log('Using WebGPU for blur rendering');
     } else {
@@ -69,9 +67,9 @@ async function initializeBlurRenderer() {
     appProcessedVideo.style.display = 'block';
 
   } catch (error) {
-    console.warn(`Failed to initialize ${useWebGPU ? 'WebGPU' : 'WebGL2'} renderer:`, error);
+    console.warn(`Failed to initialize ${webGpuDevice ? 'WebGPU' : 'WebGL2'} renderer:`, error);
     // Fallback to WebGL2 if WebGPU fails
-    if (useWebGPU) {
+    if (webGpuDevice) {
       appBlurRenderer = await createWebGL2BlurRenderer(segmenter);
       // The fallback should also use the video element path
       appProcessedVideo.style.display = 'block';
@@ -175,8 +173,13 @@ async function run() {
     appProcessedVideo.style.display = 'block';
   } else {
     // Fallback to main thread processing
-    await initializeSegmenter();
-    await initializeBlurRenderer();
+    const useWebGPU = document.querySelector('input[name="renderer"]:checked').value === 'webgpu';
+    let webGpuDevice = null;
+    if (useWebGPU && 'gpu' in navigator) {
+      webGpuDevice = await getWebGPUDevice();
+    }
+    await initializeSegmenter(webGpuDevice);
+    await initializeBlurRenderer(webGpuDevice);
     const onFpsUpdate = (fps) => { appFpsDisplay.textContent = `FPS: ${fps}`; };
     processFrames(trackProcessor.readable, trackGenerator.writable, onFpsUpdate).catch(e => {
       if (isRunning) {
