@@ -6,7 +6,7 @@ import { WebGPUBlur } from './webgpu-blur.js';
 
 class WebGPURenderer {
   constructor(device, segmenter, blurrer, { zeroCopy, directOutput }) {
-    console.log("createWebGPUBlurRenderer zeroCopy:", zeroCopy, "directOutput:", directOutput);
+    console.log("createWebGPUBlurRenderer", { zeroCopy, directOutput });
     this.device = device;
     this.segmenter = segmenter;
     this.blurrer = blurrer;

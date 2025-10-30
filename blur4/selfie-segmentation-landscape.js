@@ -104,17 +104,10 @@ export class SelfieSegmentationLandscape {
     }
 
     async load({ webGpuDevice } = {}) {
-        if (webGpuDevice) {
-            console.assert(this.deviceType_ === 'gpu', 'WebGPU interop requires deviceType to be "gpu"');
-            console.assert(this.layout === 'nhwc', 'WebGPU interop requires nhwc layout');
-            console.log('Creating WebML context with WebGPU device for WebGPU interop.');
-            this.context_ = await navigator.ml.createContext(webGpuDevice);
-        } else {
-            console.log(`Creating WebML context with device type: ${this.deviceType_}`);
-            this.context_ = await navigator.ml.createContext({
-                deviceType: this.deviceType_,
-            });
-        }
+        console.log(`Creating WebML context with device type ${this.deviceType_}`);
+        this.context_ = await navigator.ml.createContext({
+            deviceType: this.deviceType_,
+        });
 
         // Choose the layout based on the preferred input layout of the context.
         this.layout = this.layout ?? this.context_.opSupportLimits().preferredInputLayout;
@@ -147,14 +140,13 @@ export class SelfieSegmentationLandscape {
         };
         const input = this.builder_.input('input', inputDesc);
         inputDesc.writable = true;
-        inputDesc.exportableToGPU = Boolean(webGpuDevice);
-        this.inputTensor_ = await this.context_.createTensor(inputDesc);
-        this.outputTensor_ = await this.context_.createTensor({
+        const createFn = webGpuDevice ? "createExportableTensor" : "createTensor";
+        this.inputTensor_ = await this.context_[createFn](inputDesc, webGpuDevice);
+        this.outputTensor_ = await this.context_[createFn]({
             dataType: this.dataType_,
             shape: this.outputShape_,
             readable: true,
-            exportableToGPU: Boolean(webGpuDevice),
-        });
+        }, webGpuDevice);
 
         this.addB_ = this.builder_.constant(
             {dataType: this.dataType_, shape: [1, 1, 1, 1]},
