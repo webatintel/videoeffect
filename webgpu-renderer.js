@@ -5,13 +5,14 @@
 import { WebGPUBlur } from './webgpu-blur.js';
 
 class WebGPURenderer {
-  constructor(device, segmenter, blurrer, { zeroCopy, directOutput }, {useWebNN, zeroCopyTensor}) {
+  constructor(device, segmenter, blurrer, { zeroCopy, directOutput, useFragment }, {useWebNN, zeroCopyTensor}) {
     console.log("createWebGPUBlurRenderer", { zeroCopy, directOutput });
     this.device = device;
     this.segmenter = segmenter;
     this.blurrer = blurrer;
     this.zeroCopy = zeroCopy;
     this.directOutput = directOutput;
+    this.useFragment = useFragment;
     this.useWebNN = useWebNN;
     this.zeroCopyTensor = zeroCopyTensor;
 
@@ -33,7 +34,9 @@ class WebGPURenderer {
     this.segmentationHeight = 144;
     this.downscaledImageData = new ImageData(this.segmentationWidth, this.segmentationHeight);
     let downscaleShaderUrl;
-    if (this.useWebNN && this.zeroCopyTensor) {
+    if (this.useFragment) {
+      downscaleShaderUrl = 'blur4/shaders/downscale.fragment.wgsl';
+    } else if (this.useWebNN && this.zeroCopyTensor) {
       downscaleShaderUrl = 'blur4/shaders/downscale-and-convert-to-rgb16float.wgsl';
     } else {
       downscaleShaderUrl = 'blur4/shaders/downscale-and-convert-to-rgba8unorm.wgsl';
@@ -44,10 +47,30 @@ class WebGPURenderer {
           inputTextureType: zeroCopy ? "texture_external" : "texture_2d<f32>",
         }[groups[1]]))
       }));
-    this.downscalePipeline = this.downscaleModule.then(module => this.device.createComputePipeline({
-      layout: 'auto',
-      compute: { module: module, entryPoint: 'main' },
-    }));
+
+    if (this.useFragment) {
+      this.downscalePipeline = this.downscaleModule.then(module => this.device.createRenderPipeline({
+        label: 'downscale',
+        layout: 'auto',
+        vertex: {
+          module: module,
+        },
+        primitive: {
+          topology: 'triangle-strip'
+        },
+        fragment: {
+          module: module,
+          targets: [{
+            format: 'rgba8unorm'
+          }]
+        }
+      }));
+    } else {
+      this.downscalePipeline = this.downscaleModule.then(module => this.device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: module, entryPoint: 'main' },
+      }));
+    }
     this.downscaleSampler = this.device.createSampler({
       magFilter: 'linear',
       minFilter: 'linear',
@@ -78,7 +101,7 @@ class WebGPURenderer {
     const cacheKey = `${key}_${width}x${height}_${format}_${usage}`;
 
     let texture = this.resourceCache[cacheKey];
-    if (!texture || texture.width !== width || texture.height !== height) {
+    if (!texture || texture.width !== width || texture.height !== height || texture.usage !== usage) {
       console.log("Creating new texture", cacheKey, "with format", format, "and usage", usage);
       if (texture) {
         console.log("Destroying old texture", cacheKey);
@@ -91,7 +114,7 @@ class WebGPURenderer {
   }
 
   async getOutputRendererFragmentShader(device, width, height) {
-    if (!this.outputRendererFragmentShader || this.lastDim !== [width, height]) {
+    if (!this.outputRendererFragmentShader || this.lastDim[0] != width || this.lastDim[1] != height) {
       this.outputRendererFragmentShader = await this.device.createShaderModule({
         code: await fetch('blur4/shaders/render.fragment.wgsl').then(res => res.text())
           .then(code => code.replace(/\${(\w+)}/g, (...groups) => ({ width, height }[groups[1]]))),
@@ -110,25 +133,49 @@ class WebGPURenderer {
     } else {
       destTexture = this.getOrCreateTexture('downscaleDest', {
         size: [this.segmentationWidth, this.segmentationHeight, 1],
-        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
+        usage: (this.useFragment ? GPUTextureUsage.RENDER_ATTACHMENT : GPUTextureUsage.STORAGE_BINDING) | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
         format: 'rgba8unorm',
       });
     }
-    const downscaleBindGroup = this.device.createBindGroup({
-      layout: (await this.downscalePipeline).getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.zeroCopy ? sourceTexture : sourceTexture.createView() },
-        { binding: 1, resource: this.downscaleSampler },
-        { binding: 2, resource: useInterop ? destTexture : destTexture.createView() },
-      ],
-    });
 
     const commandEncoder = this.device.createCommandEncoder();
-    const computePass = commandEncoder.beginComputePass();
-    computePass.setPipeline(await this.downscalePipeline);
-    computePass.setBindGroup(0, downscaleBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
-    computePass.end();
+
+    if (this.useFragment) {
+      const downscaleBindGroup = this.device.createBindGroup({
+        layout: (await this.downscalePipeline).getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.zeroCopy ? sourceTexture : sourceTexture.createView() },
+          { binding: 1, resource: this.downscaleSampler },
+        ],
+      });
+
+      const renderPass = commandEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: destTexture.createView(),
+          loadOp: 'clear',
+          storeOp: 'store'
+        }]
+      });
+      renderPass.setPipeline(await this.downscalePipeline);
+      renderPass.setBindGroup(0, downscaleBindGroup);
+      renderPass.draw(4);
+      renderPass.end();
+    } else {
+      const downscaleBindGroup = this.device.createBindGroup({
+        layout: (await this.downscalePipeline).getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.zeroCopy ? sourceTexture : sourceTexture.createView() },
+          { binding: 1, resource: this.downscaleSampler },
+          { binding: 2, resource: useInterop ? destTexture : destTexture.createView() },
+        ],
+      });
+
+      const computePass = commandEncoder.beginComputePass();
+      computePass.setPipeline(await this.downscalePipeline);
+      computePass.setBindGroup(0, downscaleBindGroup);
+      computePass.dispatchWorkgroups(Math.ceil(this.segmentationWidth / 8), Math.ceil(this.segmentationHeight / 8));
+      computePass.end();
+    }
 
     if (useInterop) {
       this.device.queue.submit([commandEncoder.finish()]);
@@ -231,7 +278,7 @@ class WebGPURenderer {
     const canvasTexture = this.context.getCurrentTexture();
     const outputTexture = this.getOrCreateTexture('outputTexture', {
       size: [width, height, 1],
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
+      usage: (this.useFragment ? GPUTextureUsage.RENDER_ATTACHMENT : GPUTextureUsage.STORAGE_BINDING) | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
     });
 
     const commandEncoder = this.device.createCommandEncoder();
@@ -299,12 +346,20 @@ export async function getWebGPUDevice() {
   // Ensure we're compatible with directOutput
   console.log("Adapter features:");
   console.log([...adapter.features]);
-  const requiredFeatures = ['bgra8unorm-storage', 'shader-f16', 'texture-formats-tier1'];
+  const requiredFeatures = ['bgra8unorm-storage', 'shader-f16'];
   for (const feature of requiredFeatures) {
     if (!adapter.features.has(feature)) {
       console.log(`${feature} is not supported`);
     }
   }
+  // Optional features that we would nevertheless like to have.
+  const desiredFeatures = ['texture-formats-tier1'];
+  for (const feature of desiredFeatures) {
+    if (adapter.features.has(feature)) {
+      requiredFeatures.push(feature);
+    }
+  }
+  
   const device = await adapter.requestDevice({ requiredFeatures });
   if (!device) {
     console.error('WebGPU adapter does not support the required features:', requiredFeatures);
@@ -314,9 +369,9 @@ export async function getWebGPUDevice() {
 }
 
 // WebGPU blur renderer
-export async function createWebGPUBlurRenderer(device, segmenter, zeroCopy, directOutput, useWebNN, zeroCopyTensor) {
-  const blurrer = new WebGPUBlur(device, zeroCopy, directOutput);
+export async function createWebGPUBlurRenderer(device, segmenter, zeroCopy, directOutput, useWebNN, zeroCopyTensor, useFragment) {
+  const blurrer = new WebGPUBlur(device, zeroCopy, directOutput, useFragment);
   await blurrer.init();
 
-  return new WebGPURenderer(device, segmenter, blurrer, { zeroCopy, directOutput }, {useWebNN, zeroCopyTensor});
+  return new WebGPURenderer(device, segmenter, blurrer, { zeroCopy, directOutput, useFragment }, {useWebNN, zeroCopyTensor});
 }

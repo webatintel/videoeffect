@@ -54,8 +54,9 @@ async function initializeBlurRenderer(webGpuDevice) {
       const zeroCopy = zeroCopyCheckbox.checked;
       const directOutput = directOutputCheckbox.checked;
       const zeroCopyTensor = webnnZeroCopyCheckbox.checked;
+      const useFragment = shaderTypeFrag.checked;
       const useWebNN = webnnRadio.checked;
-      appBlurRenderer = await createWebGPUBlurRenderer(webGpuDevice, segmenter, zeroCopy, directOutput, useWebNN, zeroCopyTensor);
+      appBlurRenderer = await createWebGPUBlurRenderer(webGpuDevice, segmenter, zeroCopy, directOutput, useWebNN, zeroCopyTensor, useFragment);
       appStatus.innerText = 'Renderer: WebGPU';
       console.log('Using WebGPU for blur rendering');
     } else {
@@ -145,6 +146,7 @@ async function runInWorker(trackProcessor, trackGenerator) {
       segmenterType: document.querySelector('input[name="segmenter"]:checked').value,
       zeroCopy: zeroCopyCheckbox ? zeroCopyCheckbox.checked : false,
       directOutput: directOutputCheckbox ? directOutputCheckbox.checked : false,
+      useFragment: shaderTypeFrag ? shaderTypeFrag.checked : false,
     };
 
     // Transfer the readable and writable streams to the worker for zero-copy data handling.
@@ -213,6 +215,10 @@ const zeroCopyCheckbox = document.getElementById('zeroCopy');
 const zeroCopyLabel = document.getElementById('zeroCopyLabel');
 const directOutputCheckbox = document.getElementById('directOutput');
 const directOutputLabel = document.getElementById('directOutputLabel');
+const shaderTypeComputeLabel = document.getElementById('shaderTypeComputeLabel');
+const shaderTypeCompute = document.getElementById('shaderTypeCompute');
+const shaderTypeFragLabel = document.getElementById('shaderTypeFragLabel');
+const shaderTypeFrag = document.getElementById('shaderTypeFrag');
 const webnnRadio = document.getElementById('segmenter-webnn');
 const webnnZeroCopyCheckbox = document.getElementById('webnnZeroCopy');
 const webrtcSink = document.getElementById('webrtcSink');
@@ -305,6 +311,10 @@ function updateOptionState() {
   zeroCopyLabel.style.color = isWebGPU ? '' : '#aaa';
   directOutputCheckbox.disabled = !isWebGPU;
   directOutputLabel.style.color = isWebGPU ? '' : '#aaa';
+  shaderTypeCompute.disabled = !isWebGPU;
+  shaderTypeComputeLabel.style.color = isWebGPU ? '' : '#aaa';
+  shaderTypeFrag.disabled = !isWebGPU;
+  shaderTypeFragLabel.style.color = isWebGPU ? '' : '#aaa';
 
   const useWebRTCSink = webrtcSink.checked;
   webrtcCodec.style.display = useWebRTCSink ? 'inline-block' : 'none';
@@ -384,7 +394,7 @@ async function initializeApp() {
     updateOptionState();
 
     // If the app is running, and a core pipeline option changed, restart the pipeline.
-    const restartNeededOptions = ['renderer', 'useWorker', 'segmenter', 'zeroCopy', 'directOutput'];
+    const restartNeededOptions = ['renderer', 'useWorker', 'segmenter', 'zeroCopy', 'directOutput', 'shaderType'];
     if (isRunning && restartNeededOptions.includes(event.target.name)) {
       console.log(`Restarting pipeline due to change in '${event.target.name}'`);
       stopVideoProcessing();

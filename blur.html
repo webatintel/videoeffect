@@ -29,6 +29,10 @@
       display: block;
       margin-bottom: 10px;
     }
+
+    .inline label {
+      display: inline-block
+    }
   </style>
 </head>
 
@@ -53,6 +57,15 @@
       <label>
         <input type="radio" name="renderer" value="webgpu" id="webgpuRadio" /> WebGPU (Advanced, requires compatible browser)
       </label>
+      <div style="padding-left: 20px;" class='inline'>
+        <b>Shader Type</b>:
+        <label id="shaderTypeComputeLabel">
+          <input type="radio" name="shaderType" value="compute" id="shaderTypeCompute" /> Compute
+        </label>
+        <label id="shaderTypeFragLabel">
+          <input type="radio" name="shaderType" value="fragment" id="shaderTypeFrag" checked /> Fragment
+        </label>
+      </div>
       <label style="padding-left: 20px;" id="zeroCopyLabel">
         <input type="checkbox" id="zeroCopy" name="zeroCopy" unchecked /> Zero-copy import
       </label>
